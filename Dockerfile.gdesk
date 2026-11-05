@@ -1,0 +1,18 @@
+# GDesk Remoto -- imagem do servidor (hbbs + hbbr) com as alterações da GD
+# Soluções (licença conferida no servidor, ver src/gdesk.rs). Gerada pelo
+# GitHub Actions (.github/workflows/gdesk-docker.yml) e publicada em
+# ghcr.io/dillwellington/gdesk-remoto-servidor.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --bin hbbs --bin hbbr
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/hbbs /usr/bin/hbbs
+COPY --from=build /src/target/release/hbbr /usr/bin/hbbr
+# Mesmo diretório de trabalho da imagem oficial: as chaves (id_ed25519*)
+# ficam no volume montado em /root.
+WORKDIR /root

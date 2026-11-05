@@ -40,6 +40,10 @@ lazy_static::lazy_static! {
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
+// GDesk Remoto: duração máxima de cada sessão neste relay, em segundos (0 =
+// sem limite). Usado no hbbr "limitado" pra onde o hbbs manda as sessões
+// sem licença (ver src/gdesk.rs).
+static GDESK_LIMITE_SESSAO: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
 const BLACKLIST_FILE: &str = "blacklist.txt";
@@ -126,6 +130,13 @@ fn check_params() {
         "DOWNGRADE_START_CHECK: {}s",
         DOWNGRADE_START_CHECK.load(Ordering::SeqCst) / 1000
     );
+    let tmp = crate::common::get_arg("GDESK_LIMITE_SESSAO")
+        .parse::<usize>()
+        .unwrap_or(0);
+    GDESK_LIMITE_SESSAO.store(tmp, Ordering::SeqCst);
+    if tmp > 0 {
+        log::info!("GDESK_LIMITE_SESSAO: {}s", tmp);
+    }
     let tmp = crate::common::get_arg("LIMIT_SPEED")
         .parse::<f64>()
         .unwrap_or(0.);
@@ -519,6 +530,8 @@ async fn relay(
         (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
+    let inicio_sessao = std::time::Instant::now();
+    let limite_sessao = GDESK_LIMITE_SESSAO.load(Ordering::SeqCst) as u64;
     loop {
         tokio::select! {
             res = peer.recv() => {
@@ -562,6 +575,9 @@ async fn relay(
             _ = timer.tick() => {
                 if last_recv_time.elapsed().as_secs() > 30 {
                     bail!("Timeout");
+                }
+                if limite_sessao > 0 && inicio_sessao.elapsed().as_secs() >= limite_sessao {
+                    bail!("GDesk: limite de sessão sem licença");
                 }
             }
         }

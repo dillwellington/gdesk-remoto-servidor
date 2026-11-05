@@ -1,0 +1,52 @@
+# GDesk Remoto -- compila e publica a imagem Docker do servidor no GHCR.
+# Rodar: Actions > "GDesk Remoto - imagem do servidor" > Run workflow
+# (ou push na master mexendo em src/, libs/, Cargo.* ou Dockerfile.gdesk).
+name: GDesk Remoto - imagem do servidor
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "libs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.gdesk"
+      - ".github/workflows/gdesk-docker.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  imagem:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nome da imagem (minúsculo)
+        id: nome
+        run: echo "imagem=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.gdesk
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.nome.outputs.imagem }}:latest
+            ${{ steps.nome.outputs.imagem }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
