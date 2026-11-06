@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -51,7 +51,9 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    // GDesk: o Encrypt existe quando o cliente fez a troca de chaves
+    // (ver handle_listener_inner); tudo que sai por aqui vai cifrado.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -910,7 +912,11 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = match enc.as_mut() {
+                            Some(enc) => enc.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1273,9 +1279,64 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            // GDesk: troca de chaves no TCP (o que o servidor Pro do RustDesk
+            // faz). Assim que conecta, o servidor manda uma chave temporária
+            // assinada com a chave do servidor (id_ed25519) -- o app confere
+            // com a chave pública embutida. Quem quer cifrar (app logado, com
+            // token) responde KeyExchange{[pk do app, chave simétrica lacrada]}
+            // e daí em diante tudo vai cifrado (versão 0 do RustDesk: uma
+            // chave, contador por sentido). Quem não quer manda a mensagem
+            // normal em claro -- o app ignora o KeyExchange que chegou
+            // (get_next_nonkeyexchange_msg) e segue como antes.
+            let mut sk_temporaria = None;
+            if let Some(sk) = self.inner.sk.as_ref() {
+                let (pk_temporaria, sk_t) = box_::gen_keypair();
+                let mut msg = RendezvousMessage::new();
+                msg.set_key_exchange(KeyExchange {
+                    keys: vec![sign::sign(&pk_temporaria.0, sk).into()],
+                    ..Default::default()
+                });
+                if let Ok(bytes) = msg.write_to_bytes() {
+                    if a.send(Bytes::from(bytes)).await.is_ok() {
+                        sk_temporaria = Some(sk_t);
+                    }
+                }
+            }
+            let mut decifrar: Option<Encrypt> = None;
+            sink = Some(Sink::TcpStream(a, None));
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(enc) = decifrar.as_mut() {
+                    if let Err(err) = enc.dec(&mut bytes) {
+                        log::warn!("GDesk: mensagem cifrada inválida de {}: {}", addr, err);
+                        break;
+                    }
+                } else if let Some(sk_t) = sk_temporaria.take() {
+                    // Só a PRIMEIRA mensagem pode ser a resposta da troca.
+                    if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+                        if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union {
+                            if ex.keys.len() != 2 {
+                                log::warn!("GDesk: troca de chaves inválida de {}", addr);
+                                break;
+                            }
+                            match Encrypt::decode(&ex.keys[1], &ex.keys[0], &sk_t) {
+                                Ok(chave) => {
+                                    let enc = Encrypt::new(chave);
+                                    decifrar = Some(enc.clone());
+                                    if let Some(Sink::TcpStream(_, cifrar)) = sink.as_mut() {
+                                        *cifrar = Some(enc);
+                                    }
+                                    log::debug!("GDesk: conexão {} cifrada", addr);
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::warn!("GDesk: troca de chaves com {} falhou: {}", addr, err);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
